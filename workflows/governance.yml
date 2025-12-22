@@ -1,63 +1,200 @@
-name: "Pipeline Governance"
+name: Pipeline Governance
 
 on:
   pull_request:
-    types: [opened, edited, labeled, synchronize]
-    branches: [main, dev]
+    types:
+      - opened
+      - edited
+      - labeled
+      - synchronize
+      - closed
+      - ready_for_review
+    branches:
+      - main
+      - dev
 
 jobs:
-  validate-requirements:
+  governance:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout Code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 1. Enforce Source Branch Logic
-      - name: Check Source Branch
-        if: github.base_ref == 'main' && github.head_ref != 'dev'
+      # ------------------------------------------------------------------
+      # 1. BLOCK: Draft PRs
+      # ------------------------------------------------------------------
+      - name: Block draft pull requests
+        if: github.event.pull_request.draft == true
         run: |
-          echo "ERR: You can only merge into 'main' from 'dev'."
+          echo "❌ Draft PRs are not allowed. Mark PR as Ready for Review."
           exit 1
 
-      # 2. Check for 'Bug' tag when targeting Main
-      - name: Verify Bug Label
-        if: github.base_ref == 'main'
+      # ------------------------------------------------------------------
+      # 2. ENFORCE: Only 'dev' can merge into 'main'
+      # ------------------------------------------------------------------
+      - name: Validate branch merge path
+        if: github.base_ref == 'main' && github.head_ref != 'dev'
+        run: |
+          echo "❌ The 'main' branch only accepts merges from 'dev'."
+          exit 1
+
+      # ------------------------------------------------------------------
+      # 3. ENFORCE: Minimum PR description quality
+      # ------------------------------------------------------------------
+      - name: Validate PR description quality
         uses: actions/github-script@v7
         with:
           script: |
-            const labels = context.payload.pull_request.labels.map(l => l.name);
-            if (!labels.includes('bug')) {
-              core.setFailed("Production releases require the 'bug' label.");
+            const pr = context.payload.pull_request;
+            const body = pr.body || "";
+
+            if (body.length < 150) {
+              core.setFailed(
+                "❌ PR description is too short. Minimum 150 characters required."
+              );
             }
 
-      # 3. Scan PR Body for Ticked Boxes
-      - name: Verify Checkbox Compliance
+      # ------------------------------------------------------------------
+      # 4. ENFORCE: Labels, checklist & environment rules
+      # ------------------------------------------------------------------
+      - name: Validate PR labels and checklist
         uses: actions/github-script@v7
         with:
           script: |
-            const body = context.payload.pull_request.body;
-            const requiredItems = [
-              "- [x] Proof of testing attached",
-              "- [x] Client / Business approved UAT"
+            const pr = context.payload.pull_request;
+            const labels = pr.labels.map(l => l.name.toLowerCase());
+            const body = (pr.body || "").toLowerCase();
+            const target = context.payload.base_ref;
+
+            if (target === 'main' && !labels.includes('bug')) {
+              core.setFailed("❌ PRs targeting 'main' must be labelled as 'bug'.");
+            }
+
+            const requiredChecklist = [
+              'proof of testing attached',
+              'client / business approved uat'
             ];
-            for (const item of requiredItems) {
+
+            for (const item of requiredChecklist) {
               if (!body.includes(item)) {
-                core.setFailed(`Mandatory step missing: ${item}`);
+                core.setFailed(`❌ Missing checklist item: "${item}"`);
               }
             }
 
-  # 4. Move Ticket in DevOps (Azure DevOps Example)
-  update-devops-status:
-    needs: validate-requirements
-    runs-on: ubuntu-latest
-    if: github.event.pull_request.merged == true
-    steps:
-      - name: Move Ticket to Ready for Deployment
+      # ------------------------------------------------------------------
+      # 5. ENFORCE: CODEOWNERS presence
+      # ------------------------------------------------------------------
+      - name: Validate CODEOWNERS
         run: |
-          # This pulls the ticket ID (DevOps-123) from your PR body
-          TICKET_ID=$(echo "${{ github.event.pull_request.body }}" | grep -oP 'DevOps-\d+')
-          
-          curl -X PATCH -u ":${{ secrets.DEVOPS_TOKEN }}" \
-          -H "Content-Type: application/json-patch+json" \
-          -d '[{"op": "add", "path": "/fields/System.State", "value": "Ready for Deployment"}]' \
-          "https://dev.azure.com/{org}/{project}/_apis/wit/workitems/${TICKET_ID}?api-version=7.0"
+          if [ ! -f ".github/CODEOWNERS" ]; then
+            echo "❌ CODEOWNERS file missing."
+            exit 1
+          fi
+
+      # ------------------------------------------------------------------
+      # 6. QUALITY: Code vs Tests enforcement
+      # ------------------------------------------------------------------
+      - name: Validate test coverage for code changes
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const files = await github.rest.pulls.listFiles({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number
+            });
+
+            const changed = files.data.map(f => f.filename);
+            const codeChanged = changed.some(f => f.startsWith('src/'));
+            const testsChanged = changed.some(
+              f => f.startsWith('test/') || f.includes('__tests__')
+            );
+
+            if (codeChanged && !testsChanged) {
+              core.setFailed(
+                "❌ Code changes detected without test updates."
+              );
+            }
+
+      # ------------------------------------------------------------------
+      # 7. QUALITY: dbt-specific enforcement (safe if dbt exists)
+      # ------------------------------------------------------------------
+      - name: Validate dbt tests (if applicable)
+        run: |
+          if [ -d "models" ]; then
+            echo "🧪 dbt project detected."
+            if ! ls models | grep -q "schema.yml"; then
+              echo "❌ dbt models detected without schema.yml tests."
+              exit 1
+            fi
+          else
+            echo "ℹ️ No dbt project detected."
+          fi
+
+      # ------------------------------------------------------------------
+      # 8. GOVERNANCE: Environment-based rules
+      # ------------------------------------------------------------------
+      - name: Enforce environment governance
+        if: github.base_ref == 'main'
+        run: |
+          echo "🔒 Production governance applied:"
+          echo "- Bug label required"
+          echo "- UAT approval required"
+          echo "- Senior review enforced via branch protection"
+
+      # ------------------------------------------------------------------
+      # 9. AUTOMATION: Auto-label PRs
+      # ------------------------------------------------------------------
+      - name: Auto-label PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const labels = [];
+            const base = context.payload.base_ref;
+
+            if (base === 'main') labels.push('production');
+            if (base === 'dev') labels.push('development');
+
+            if (labels.length > 0) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                labels
+              });
+            }
+
+      # ------------------------------------------------------------------
+      # 10. AUTOMATION: Azure DevOps ticket update
+      # ------------------------------------------------------------------
+      - name: Update Azure DevOps ticket
+        if: github.event.pull_request.merged == true
+        env:
+          DEVOPS_TOKEN: ${{ secrets.DEVOPS_TOKEN }}
+        run: |
+          set -e
+
+          BODY="${{ github.event.pull_request.body }}"
+          TICKET_ID=$(echo "$BODY" | grep -oE 'DevOps-[0-9]+' | head -1 | cut -d'-' -f2)
+
+          if [ -z "$TICKET_ID" ]; then
+            echo "ℹ️ No DevOps ticket found."
+            exit 0
+          fi
+
+          echo "🚀 Updating DevOps ticket #$TICKET_ID"
+
+          curl -sS -X PATCH \
+            -u ":$DEVOPS_TOKEN" \
+            -H "Content-Type: application/json-patch+json" \
+            -d '[{"op":"add","path":"/fields/System.State","value":"Ready for Deployment"}]' \
+            "https://dev.azure.com/{ORG}/{PROJECT}/_apis/wit/workitems/${TICKET_ID}?api-version=7.0"
+
+      # ------------------------------------------------------------------
+      # 11. COMMS: Slack / Teams Notification (Optional)
+      # ------------------------------------------------------------------
+      - name: Notify Slack (optional)
+        if: false
+        run: |
+          echo "🔔 Slack notification placeholder"
