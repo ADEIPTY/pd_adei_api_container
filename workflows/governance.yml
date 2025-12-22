@@ -1,0 +1,63 @@
+name: "Pipeline Governance"
+
+on:
+  pull_request:
+    types: [opened, edited, labeled, synchronize]
+    branches: [main, dev]
+
+jobs:
+  validate-requirements:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 1. Enforce Source Branch Logic
+      - name: Check Source Branch
+        if: github.base_ref == 'main' && github.head_ref != 'dev'
+        run: |
+          echo "ERR: You can only merge into 'main' from 'dev'."
+          exit 1
+
+      # 2. Check for 'Bug' tag when targeting Main
+      - name: Verify Bug Label
+        if: github.base_ref == 'main'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const labels = context.payload.pull_request.labels.map(l => l.name);
+            if (!labels.includes('bug')) {
+              core.setFailed("Production releases require the 'bug' label.");
+            }
+
+      # 3. Scan PR Body for Ticked Boxes
+      - name: Verify Checkbox Compliance
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.pull_request.body;
+            const requiredItems = [
+              "- [x] Proof of testing attached",
+              "- [x] Client / Business approved UAT"
+            ];
+            for (const item of requiredItems) {
+              if (!body.includes(item)) {
+                core.setFailed(`Mandatory step missing: ${item}`);
+              }
+            }
+
+  # 4. Move Ticket in DevOps (Azure DevOps Example)
+  update-devops-status:
+    needs: validate-requirements
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.merged == true
+    steps:
+      - name: Move Ticket to Ready for Deployment
+        run: |
+          # This pulls the ticket ID (DevOps-123) from your PR body
+          TICKET_ID=$(echo "${{ github.event.pull_request.body }}" | grep -oP 'DevOps-\d+')
+          
+          curl -X PATCH -u ":${{ secrets.DEVOPS_TOKEN }}" \
+          -H "Content-Type: application/json-patch+json" \
+          -d '[{"op": "add", "path": "/fields/System.State", "value": "Ready for Deployment"}]' \
+          "https://dev.azure.com/{org}/{project}/_apis/wit/workitems/${TICKET_ID}?api-version=7.0"
