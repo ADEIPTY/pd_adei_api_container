@@ -1,0 +1,82 @@
+trigger:
+  - main
+  - dev
+
+# This ensures the pipeline runs on Pull Requests
+pr:
+  branches:
+    include:
+      - main
+      - dev
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  # Reference the secret you created in Azure DevOps Library or Secrets
+  devopsToken: $(DEVOPS_TOKEN) 
+  githubToken: $(GITHUB_TOKEN)
+
+jobs:
+- job: Governance_and_Validation
+  displayName: "Validate PR and Update Ticket"
+  condition: eq(variables['Build.Reason'], 'PullRequest') # Only run on PRs
+  steps:
+
+  # 1. ENFORCE: Branch Path (Only dev -> main)
+  - bash: |
+      SOURCE_BRANCH=$(System.PullRequest.SourceBranch)
+      TARGET_BRANCH=$(System.PullRequest.TargetBranch)
+      echo "Source: $SOURCE_BRANCH, Target: $TARGET_BRANCH"
+      if [[ "$TARGET_BRANCH" == "main" && "$SOURCE_BRANCH" != "dev" ]]; then
+        echo "##vso[task.logissue type=error]ERROR: You can only merge into 'main' from 'dev'."
+        exit 1
+      fi
+    displayName: 'Validate Branch Path'
+
+  # 2. ENFORCE: Bug Label and Checkboxes
+  # Note: This calls the GitHub API to check the PR details
+  - bash: |
+      PR_NUMBER=$(System.PullRequest.PullRequestNumber)
+      REPO_NAME=$(Build.Repository.Name)
+      
+      # Fetch PR details from GitHub API
+      PR_DATA=$(curl -s -H "Authorization: token $(githubToken)" "https://api.github.com/repos/$REPO_NAME/pulls/$PR_NUMBER")
+      
+      LABELS=$(echo $PR_DATA | jq -r '.labels[].name')
+      BODY=$(echo $PR_DATA | jq -r '.body')
+      TARGET_BRANCH=$(System.PullRequest.TargetBranch)
+
+      # Check for Bug Label if targeting Main
+      if [[ "$TARGET_BRANCH" == "main" ]]; then
+        if [[ ! "$LABELS" =~ "bug" ]]; then
+          echo "##vso[task.logissue type=error]Production releases MUST have the 'bug' label."
+          exit 1
+        fi
+      fi
+
+      # Check for mandatory checkboxes
+      if [[ ! "$BODY" =~ "- [x] Proof of testing attached" ]] || [[ ! "$BODY" =~ "- [x] Client / Business approved UAT" ]]; then
+        echo "##vso[task.logissue type=error]Mandatory Checkboxes not ticked in PR description."
+        exit 1
+      fi
+    displayName: 'Validate GitHub PR Labels & Checkboxes'
+
+  # 3. AUTONOMOUS: Move Ticket to 'Ready for Deployment'
+  - bash: |
+      PR_BODY=$(curl -s -H "Authorization: token $(githubToken)" "https://api.github.com/repos/$(Build.Repository.Name)/pulls/$(System.PullRequest.PullRequestNumber)" | jq -r '.body')
+      
+      # Extract Ticket ID (e.g., DevOps-123)
+      TICKET_ID=$(echo "$PR_BODY" | grep -oP 'DevOps-\d+' | head -1 | cut -d'-' -f2)
+      
+      if [ -z "$TICKET_ID" ]; then
+        echo "No DevOps Ticket ID found. Skipping status update."
+      else
+        echo "Moving Ticket #$TICKET_ID to 'Ready for Deployment'..."
+        curl -X PATCH -u ":$(devopsToken)" \
+        -H "Content-Type: application/json-patch+json" \
+        -d '[{"op": "add", "path": "/fields/System.State", "value": "Ready for Deployment"}]' \
+        "$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_apis/wit/workitems/${TICKET_ID}?api-version=7.0"
+      fi
+    displayName: 'Update Azure DevOps Work Item'
+    condition: succeeded()
