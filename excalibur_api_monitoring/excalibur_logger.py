@@ -13,7 +13,6 @@ import threading
 import queue
 from datetime import datetime
 from sqlalchemy import create_engine, text
-import time
 
 class ExcaliburAPILogger:
     """
